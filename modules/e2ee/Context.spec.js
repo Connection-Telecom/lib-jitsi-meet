@@ -1,3 +1,4 @@
+/* eslint-disable no-bitwise */
 import { Context } from './Context';
 import { ratchet, importKey } from './crypto-utils';
 
@@ -27,9 +28,38 @@ function hexdump(buffer) {
 const audioBytes = [ 0xde, 0xad, 0xbe, 0xef ];
 const videoBytes = [ 0xde, 0xad, 0xbe, 0xef, 0xde, 0xad, 0xbe, 0xef, 0xde, 0xad, 0xbe, 0xef ];
 
+/**
+ * generates a dummy audio frame
+ */
+function makeAudioFrame() {
+    return {
+        data: new Uint8Array(audioBytes).buffer,
+        type: undefined, // type is undefined for audio frames.
+        getMetadata: () => {
+            return { synchronizationSource: 123 };
+        }
+    };
+}
+
+/**
+ * generates a dummy video frame
+ */
+function makeVideoFrame() {
+    return {
+        data: new Uint8Array(videoBytes).buffer,
+        type: 'key',
+        getMetadata: () => {
+            return { synchronizationSource: 321 };
+        }
+    };
+}
+
+
 describe('E2EE Context', () => {
     let sender;
+    let sendController;
     let receiver;
+    let receiveController;
     const key = new Uint8Array([
         1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
         0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
@@ -41,59 +71,59 @@ describe('E2EE Context', () => {
     });
 
     describe('encode function', () => {
+        beforeEach(async () => {
+            await sender.setKey(key, 0);
+            await receiver.setKey(key, 0);
+        });
+
         it('with an audio frame', async done => {
-            const sendController = {
+            sendController = {
                 enqueue: encodedFrame => {
                     const data = new Uint8Array(encodedFrame.data);
 
-                    // An audio frame will have an overhead of 6 bytes with this counter and key size:
-                    //   4 bytes truncated signature, counter (1 byte) and 1 byte trailer.
-                    expect(data.byteLength).toEqual(audioBytes.length + 6);
+                    // An audio frame will have an overhead of 30 bytes and key size:
+                    // 16 bytes authentication tag, 12 bytes iv, iv length (1 byte) and 1 byte key index.
+                    expect(data.byteLength).toEqual(audioBytes.length + 30);
 
-                    // TODO: provide test vector and matcher.
+                    // TODO: provide test vector.
                     done();
                 }
             };
-            const frame = {
-                data: new Uint8Array(audioBytes).buffer,
-                type: undefined // type is undefined for audio frames.
-            };
 
-            await sender.setKey(key, 0);
-            await receiver.setKey(key, 0);
-            await sender.encodeFunction(frame, sendController);
+            await sender.encodeFunction(makeAudioFrame(), sendController);
         });
 
         it('with a video frame', async done => {
-            const sendController = {
+            sendController = {
                 enqueue: encodedFrame => {
                     const data = new Uint8Array(encodedFrame.data);
 
-                    // A video frame will have an overhead of 12 bytes with this counter and key size:
-                    //   10 bytes signature, counter (1 byte) and 1 byte trailer.
+                    // A video frame will have an overhead of 30 bytes and key size:
+                    // 16 bytes authentication tag, 12 bytes iv, iv length (1 byte) and 1 byte key index.
+                    expect(data.byteLength).toEqual(videoBytes.length + 30);
 
-                    expect(data.byteLength).toEqual(videoBytes.length + 12);
-
-                    // TODO: provide test vector and matcher.
+                    // TODO: provide test vector.
                     done();
                 }
             };
-            const frame = {
-                data: new Uint8Array(videoBytes).buffer,
-                type: 'key'
-            };
 
-            await sender.setKey(key, 0);
-            await receiver.setKey(key, 0);
-            await sender.encodeFunction(frame, sendController);
+            await sender.encodeFunction(makeVideoFrame(), sendController);
         });
     });
 
     describe('end-to-end test', () => {
-        it('with an audio frame', async done => {
+        beforeEach(async () => {
             await sender.setKey(key, 0);
             await receiver.setKey(key, 0);
-            const receiveController = {
+            sendController = {
+                enqueue: async encodedFrame => {
+                    await receiver.decodeFunction(encodedFrame, receiveController);
+                }
+            };
+        });
+
+        it('with an audio frame', async done => {
+            receiveController = {
                 enqueue: encodedFrame => {
                     const data = new Uint8Array(encodedFrame.data);
 
@@ -102,23 +132,12 @@ describe('E2EE Context', () => {
                     done();
                 }
             };
-            const sendController = {
-                enqueue: encodedFrame => {
-                    receiver.decodeFunction(encodedFrame, receiveController);
-                }
-            };
-            const frame = {
-                data: new Uint8Array(audioBytes).buffer,
-                type: undefined // type is undefined for audio frames.
-            };
 
-            await sender.encodeFunction(frame, sendController);
+            await sender.encodeFunction(makeAudioFrame(), sendController);
         });
 
         it('with a video frame', async done => {
-            await sender.setKey(key, 0);
-            await receiver.setKey(key, 0);
-            const receiveController = {
+            receiveController = {
                 enqueue: encodedFrame => {
                     const data = new Uint8Array(encodedFrame.data);
 
@@ -127,29 +146,17 @@ describe('E2EE Context', () => {
                     done();
                 }
             };
-            const sendController = {
-                enqueue: encodedFrame => {
-                    receiver.decodeFunction(encodedFrame, receiveController);
-                }
-            };
-            const frame = {
-                data: new Uint8Array(videoBytes).buffer,
-                type: 'key'
-            };
 
-            await sender.encodeFunction(frame, sendController);
+            await sender.encodeFunction(makeVideoFrame(), sendController);
         });
 
         it('the receiver ratchets forward', async done => {
-            await sender.setKey(key, 0);
-            await receiver.setKey(key, 0);
-
             // Ratchet the key. We reimport from the raw bytes.
             const material = await importKey(key);
 
             await sender.setKey(await ratchet(material), 0);
 
-            const receiveController = {
+            receiveController = {
                 enqueue: encodedFrame => {
                     const data = new Uint8Array(encodedFrame.data);
 
@@ -158,17 +165,8 @@ describe('E2EE Context', () => {
                     done();
                 }
             };
-            const sendController = {
-                enqueue: encodedFrame => {
-                    receiver.decodeFunction(encodedFrame, receiveController);
-                }
-            };
-            const frame = {
-                data: new Uint8Array(audioBytes).buffer,
-                type: undefined
-            };
 
-            await sender.encodeFunction(frame, sendController);
+            await sender.encodeFunction(makeAudioFrame(), sendController);
         });
     });
 });

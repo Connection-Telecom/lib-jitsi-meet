@@ -3,6 +3,9 @@ import { getLogger } from 'jitsi-meet-logger';
 
 const logger = getLogger(__filename);
 
+/* Minimum required Chrome / Chromium version. This applies also to derivatives. */
+const MIN_REQUIRED_CHROME_VERSION = 72;
+
 // TODO: Move this code to js-utils.
 
 // NOTE: Now we are extending BrowserDetection in order to preserve
@@ -30,35 +33,54 @@ export default class BrowserCapabilities extends BrowserDetection {
      * strategy or <tt>false</tt> otherwise.
      */
     doesVideoMuteByStreamRemove() {
-        return this.isChromiumBased() || this.isSafari();
+        return this.isChromiumBased() || this.isWebKitBased();
     }
 
     /**
-     * Check whether or not the current browser support peer to peer connections
-     * @return {boolean} <tt>true</tt> if p2p is supported or <tt>false</tt>
-     * otherwise.
-     */
-    supportsP2P() {
-        return !this.usesUnifiedPlan();
-    }
-
-    /**
-     * Checks if the current browser is Chromium based, that is, it's either
-     * Chrome / Chromium or uses it as its engine, but doesn't identify as
-     * Chrome.
+     * Checks if the current browser is Chromium based, i.e., it's either Chrome / Chromium or uses it as its engine,
+     * but doesn't identify as Chrome.
      *
      * This includes the following browsers:
-     * - Chrome and Chromium
-     * - Other browsers which use the Chrome engine, but are detected as Chrome,
-     *   such as Brave and Vivaldi
-     * - Browsers which are NOT Chrome but use it as their engine, and have
-     *   custom detection code: Opera, Electron and NW.JS
+     * - Chrome and Chromium.
+     * - Other browsers which use the Chrome engine, but are detected as Chrome, such as Brave and Vivaldi.
+     * - Browsers which are NOT Chrome but use it as their engine, and have custom detection code: Opera, Electron
+     *   and NW.JS.
+     * This excludes
+     * - Chrome on iOS since it uses WKWebView.
      */
     isChromiumBased() {
-        return this.isChrome()
+        return (this.isChrome()
             || this.isElectron()
             || this.isNWJS()
-            || this.isOpera();
+            || this.isOpera())
+            && !this.isWebKitBased();
+    }
+
+    /**
+     * Checks if the current browser is WebKit based. It's either
+     * Safari or uses WebKit as its engine.
+     *
+     * This includes Chrome and Firefox on iOS
+     *
+     * @returns {boolean}
+     */
+    isWebKitBased() {
+        // https://trac.webkit.org/changeset/236144/webkit/trunk/LayoutTests/webrtc/video-addLegacyTransceiver.html
+        return this._bowser.isEngine('webkit')
+            && typeof navigator.mediaDevices !== 'undefined'
+            && typeof navigator.mediaDevices.getUserMedia !== 'undefined'
+            && typeof window.RTCRtpTransceiver !== 'undefined'
+            // eslint-disable-next-line no-undef
+            && Object.keys(RTCRtpTransceiver.prototype).indexOf('currentDirection') > -1;
+    }
+
+    /**
+     * Checks whether current running context is a Trusted Web Application.
+     *
+     * @returns {boolean} Whether the current context is a TWA.
+     */
+    isTwa() {
+        return 'matchMedia' in window && window.matchMedia('(display-mode:standalone)').matches;
     }
 
     /**
@@ -67,10 +89,10 @@ export default class BrowserCapabilities extends BrowserDetection {
      * @returns {boolean} true if the browser is supported, false otherwise.
      */
     isSupported() {
-        return this.isChromiumBased()
+        return (this.isChromiumBased() && this._getChromiumBasedVersion() >= MIN_REQUIRED_CHROME_VERSION)
             || this.isFirefox()
             || this.isReactNative()
-            || (this.isSafari() && !this.isVersionLessThan('12.1'));
+            || this.isWebKitBased();
     }
 
     /**
@@ -90,7 +112,7 @@ export default class BrowserCapabilities extends BrowserDetection {
      * otherwise.
      */
     supportsVideoMuteOnConnInterrupted() {
-        return this.isChromiumBased() || this.isReactNative() || this.isSafari();
+        return this.isChromiumBased() || this.isReactNative();
     }
 
     /**
@@ -101,7 +123,7 @@ export default class BrowserCapabilities extends BrowserDetection {
     supportsBandwidthStatistics() {
         // FIXME bandwidth stats are currently not implemented for FF on our
         // side, but not sure if not possible ?
-        return !this.isFirefox() && !this.isSafari();
+        return !this.isFirefox() && !this.isWebKitBased();
     }
 
     /**
@@ -109,14 +131,14 @@ export default class BrowserCapabilities extends BrowserDetection {
      * @returns {boolean}
      */
     supportsCodecPreferences() {
-        return this.usesUnifiedPlan()
-            && typeof window.RTCRtpTransceiver !== 'undefined'
-            && Object.keys(window.RTCRtpTransceiver.prototype).indexOf('setCodecPreferences') > -1
-            && Object.keys(RTCRtpSender.prototype).indexOf('getCapabilities') > -1
+        return Boolean(window.RTCRtpTransceiver
+            && 'setCodecPreferences' in window.RTCRtpTransceiver.prototype
+            && window.RTCRtpReceiver
+            && typeof window.RTCRtpReceiver.getCapabilities !== 'undefined')
 
             // this is not working on Safari because of the following bug
             // https://bugs.webkit.org/show_bug.cgi?id=215567
-            && !this.isSafari();
+            && !this.isWebKitBased();
     }
 
     /**
@@ -134,7 +156,7 @@ export default class BrowserCapabilities extends BrowserDetection {
      * candidates through the legacy getStats() API.
      */
     supportsLocalCandidateRttStatistics() {
-        return this.isChromiumBased() || this.isReactNative() || this.isSafari();
+        return this.isChromiumBased() || this.isReactNative() || this.isWebKitBased();
     }
 
     /**
@@ -152,7 +174,11 @@ export default class BrowserCapabilities extends BrowserDetection {
      */
     supportsReceiverStats() {
         return typeof window.RTCRtpReceiver !== 'undefined'
-            && Object.keys(RTCRtpReceiver.prototype).indexOf('getSynchronizationSources') > -1;
+            && Object.keys(RTCRtpReceiver.prototype).indexOf('getSynchronizationSources') > -1
+
+            // Disable this on Safari because it is reporting 0.000001 as the audio levels for all
+            // remote audio tracks.
+            && !this.isWebKitBased();
     }
 
     /**
@@ -173,88 +199,21 @@ export default class BrowserCapabilities extends BrowserDetection {
     }
 
     /**
-     * Returns whether or not the current browser can support capturing video,
-     * be it camera or desktop, and displaying received video.
-     *
-     * @returns {boolean}
-     */
-    supportsVideo() {
-        return true;
-    }
-
-    /**
-     * Checks if the browser uses plan B.
-     *
-     * @returns {boolean}
-     */
-    usesPlanB() {
-        return !this.usesUnifiedPlan();
-    }
-
-    /**
      * Checks if the browser uses SDP munging for turning on simulcast.
      *
      * @returns {boolean}
      */
     usesSdpMungingForSimulcast() {
-        return this.isChromiumBased() || this.isReactNative() || this.isSafari();
+        return this.isChromiumBased() || this.isReactNative() || this.isWebKitBased();
     }
 
     /**
-     * Checks if the browser uses unified plan.
-     *
-     * @returns {boolean}
-     */
-    usesUnifiedPlan() {
-        if (this.isFirefox()) {
-            return true;
-        }
-
-        if (this.isSafari() && typeof window.RTCRtpTransceiver !== 'undefined') {
-            // eslint-disable-next-line max-len
-            // https://trac.webkit.org/changeset/236144/webkit/trunk/LayoutTests/webrtc/video-addLegacyTransceiver.html
-            // eslint-disable-next-line no-undef
-            return Object.keys(RTCRtpTransceiver.prototype)
-                   .indexOf('currentDirection') > -1;
-        }
-
-        return false;
-    }
-
-    /**
-     * Returns whether or not the current browser should be using the new
-     * getUserMedia flow, which utilizes the adapter shim. This method should
-     * be temporary and used while migrating all browsers to use adapter and
-     * the new getUserMedia.
-     *
-     * @returns {boolean}
-     */
-    usesNewGumFlow() {
-        const REQUIRED_CHROME_VERSION = 61;
-
-        if (this.isChrome()) {
-            return !this.isVersionLessThan(REQUIRED_CHROME_VERSION);
-        }
-
-        if (this.isFirefox() || this.isSafari()) {
-            return true;
-        }
-
-        if (this.isChromiumBased()) {
-            return this._getChromiumBasedVersion() >= REQUIRED_CHROME_VERSION;
-        }
-
-        return false;
-    }
-
-    /**
-     * Checks if the browser uses webrtc-adapter. All browsers using the new
-     * getUserMedia flow and Edge.
+     * Checks if the browser uses webrtc-adapter. All browsers except React Native do.
      *
      * @returns {boolean}
      */
     usesAdapter() {
-        return this.usesNewGumFlow();
+        return !this.isReactNative();
     }
 
     /**
@@ -313,13 +272,21 @@ export default class BrowserCapabilities extends BrowserDetection {
     }
 
     /**
-     * Checks if the browser supports the "sdpSemantics" configuration option.
-     * https://webrtc.org/web-apis/chrome/unified-plan/
+     * Checks if the browser supports unified plan.
      *
      * @returns {boolean}
      */
-    supportsSdpSemantics() {
-        return this.isChromiumBased() && this._getChromiumBasedVersion() >= 65;
+    supportsUnifiedPlan() {
+        return !this.isReactNative();
+    }
+
+    /**
+     * Checks if the browser supports voice activity detection via the @type {VADAudioAnalyser} service.
+     *
+     * @returns {boolean}
+     */
+    supportsVADDetection() {
+        return this.isChromiumBased();
     }
 
     /**

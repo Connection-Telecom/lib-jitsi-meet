@@ -2,7 +2,6 @@
 /* eslint-disable no-bitwise */
 
 // Worker for E2EE/Insertable streams.
-//
 
 import { Context } from './Context';
 import { polyFillEncodedFrameMetadata } from './utils';

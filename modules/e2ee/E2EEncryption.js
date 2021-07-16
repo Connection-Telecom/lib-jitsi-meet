@@ -6,6 +6,7 @@ import debounce from 'lodash.debounce';
 import * as JitsiConferenceEvents from '../../JitsiConferenceEvents';
 import RTCEvents from '../../service/RTC/RTCEvents';
 import browser from '../browser';
+import Deferred from '../util/Deferred';
 
 import E2EEContext from './E2EEContext';
 import { OlmAdapter } from './OlmAdapter';
@@ -30,8 +31,8 @@ export class E2EEncryption {
 
         this._conferenceJoined = false;
         this._enabled = false;
-        this._initialized = false;
         this._key = undefined;
+        this._enabling = undefined;
 
         this._e2eeCtx = new E2EEContext();
         this._olmAdapter = new OlmAdapter(conference);
@@ -44,16 +45,19 @@ export class E2EEncryption {
         //
 
         this.conference.on(
+            JitsiConferenceEvents.CONFERENCE_JOINED,
+            () => {
+                this._conferenceJoined = true;
+            });
+        this.conference.on(
+            JitsiConferenceEvents.PARTICIPANT_PROPERTY_CHANGED,
+            this._onParticipantPropertyChanged.bind(this));
+        this.conference.on(
             JitsiConferenceEvents.USER_JOINED,
             this._onParticipantJoined.bind(this));
         this.conference.on(
             JitsiConferenceEvents.USER_LEFT,
             this._onParticipantLeft.bind(this));
-        this.conference.on(
-            JitsiConferenceEvents.CONFERENCE_JOINED,
-            () => {
-                this._conferenceJoined = true;
-            });
 
         // Conference media events in order to attach the encryptor / decryptor.
         // FIXME add events to TraceablePeerConnection which will allow to see when there's new receiver or sender
@@ -74,6 +78,9 @@ export class E2EEncryption {
             this._trackMuteChanged.bind(this));
 
         // Olm signalling events.
+        this._olmAdapter.on(
+            OlmAdapter.events.OLM_ID_KEY_READY,
+            this._onOlmIdKeyReady.bind(this));
         this._olmAdapter.on(
             OlmAdapter.events.PARTICIPANT_E2EE_CHANNEL_READY,
             this._onParticipantE2EEChannelReady.bind(this));
@@ -109,31 +116,40 @@ export class E2EEncryption {
      * @param {boolean} enabled - whether E2EE should be enabled or not.
      * @returns {void}
      */
-    setEnabled(enabled) {
+    async setEnabled(enabled) {
         if (enabled === this._enabled) {
             return;
         }
 
+        this._enabling && await this._enabling;
+
+        this._enabling = new Deferred();
+
         this._enabled = enabled;
 
-        if (!this._initialized && enabled) {
-            // Need to re-create the peerconnections in order to apply the insertable streams constraint.
-            // TODO: this was necessary due to some audio issues when indertable streams are used
-            // even though encryption is not performed. This should be fixed in the browser eventually.
-            // https://bugs.chromium.org/p/chromium/issues/detail?id=1103280
-            this.conference._restartMediaSessions();
-
-            this._initialized = true;
+        if (enabled) {
+            await this._olmAdapter.initSessions();
+        } else {
+            for (const participant of this.conference.getParticipants()) {
+                this._e2eeCtx.cleanup(participant.getId());
+            }
+            this._olmAdapter.clearAllParticipantsSessions();
         }
+
+        this.conference.setLocalParticipantProperty('e2ee.enabled', enabled);
+
+        this.conference._restartMediaSessions();
 
         // Generate a random key in case we are enabling.
         this._key = enabled ? this._generateKey() : false;
 
         // Send it to others using the E2EE olm channel.
-        this._olmAdapter.updateKey(this._key).then(index => {
-            // Set our key so we begin encrypting.
-            this._e2eeCtx.setKey(this.conference.myUserId(), this._key, index);
-        });
+        const index = await this._olmAdapter.updateKey(this._key);
+
+        // Set our key so we begin encrypting.
+        this._e2eeCtx.setKey(this.conference.myUserId(), this._key, index);
+
+        this._enabling.resolve();
     }
 
     /**
@@ -171,12 +187,21 @@ export class E2EEncryption {
     }
 
     /**
+     * Publushes our own Olmn id key in presence.
+     * @private
+     */
+    _onOlmIdKeyReady(idKey) {
+        logger.debug(`Olm id key ready: ${idKey}`);
+
+        // Publish it in presence.
+        this.conference.setLocalParticipantProperty('e2ee.idKey', idKey);
+    }
+
+    /**
      * Advances (using ratcheting) the current key when a new participant joins the conference.
      * @private
      */
-    _onParticipantJoined(id) {
-        logger.debug(`Participant ${id} joined`);
-
+    _onParticipantJoined() {
         if (this._conferenceJoined && this._enabled) {
             this._ratchetKey();
         }
@@ -187,8 +212,6 @@ export class E2EEncryption {
      * @private
      */
     _onParticipantLeft(id) {
-        logger.debug(`Participant ${id} left`);
-
         this._e2eeCtx.cleanup(id);
 
         if (this._enabled) {
@@ -219,6 +242,30 @@ export class E2EEncryption {
     }
 
     /**
+     * Handles an update in a participant's presence property.
+     *
+     * @param {JitsiParticipant} participant - The participant.
+     * @param {string} name - The name of the property that changed.
+     * @param {*} oldValue - The property's previous value.
+     * @param {*} newValue - The property's new value.
+     * @private
+     */
+    async _onParticipantPropertyChanged(participant, name, oldValue, newValue) {
+        switch (name) {
+        case 'e2ee.idKey':
+            logger.debug(`Participant ${participant.getId()} updated their id key: ${newValue}`);
+            break;
+        case 'e2ee.enabled':
+            if (!newValue && this._enabled) {
+                this._olmAdapter.clearParticipantSession(participant);
+
+                this._rotateKey();
+            }
+            break;
+        }
+    }
+
+    /**
      * Advances the current key by using ratcheting.
      *
      * @private
@@ -231,7 +278,7 @@ export class E2EEncryption {
 
         this._key = new Uint8Array(newKey);
 
-        const index = await this._olmAdapter.updateCurrentKey(this._key);
+        const index = this._olmAdapter.updateCurrentKey(this._key);
 
         this._e2eeCtx.setKey(this.conference.myUserId(), this._key, index);
     }
